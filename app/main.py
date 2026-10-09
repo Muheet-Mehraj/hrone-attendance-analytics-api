@@ -1,8 +1,6 @@
 """HROne Employee Attendance & Analytics API.
-
 Run from the repository root with:
     uvicorn app.main:app --port 8000
-
 Configuration is read from MONGO_URI and MONGO_DB. A local .env is convenient for
 manual development, but real environment variables take precedence.
 """
@@ -11,6 +9,7 @@ from __future__ import annotations
 import calendar
 import os
 import re
+from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Annotated, Literal, Optional
@@ -24,7 +23,6 @@ from pymongo.collection import Collection
 from bson import json_util
 
 load_dotenv()
-
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB = os.getenv("MONGO_DB")
 if not MONGO_URI or not MONGO_DB:
@@ -32,7 +30,6 @@ if not MONGO_URI or not MONGO_DB:
 client = MongoClient(MONGO_URI, tz_aware=True, serverSelectionTimeoutMS=5000)
 db = client[MONGO_DB]
 _indexes_ready = False
-
 UTC = timezone.utc
 IST = timezone(timedelta(hours=5, minutes=30))
 PRESENCE_STATUSES = ("PRESENT", "WFH", "ON_DUTY")
@@ -40,11 +37,25 @@ ALL_STATUSES = ("PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY")
 EPOCH_MS_MIN = 100_000_000_000
 EPOCH_MS_MAX = 4_102_444_800_000
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Prepare MongoDB indexes when the API starts."""
+    ensure_indexes()
+    yield
+
+
+app = FastAPI(
+    title="Employee Attendance & Analytics API",
+    version="2.0.0",
+    lifespan=lifespan,
+)
 
 
 # ---------------------------------------------------------------------------
 # Validation and time helpers
+
+
 # ---------------------------------------------------------------------------
 EpochMillis = Annotated[StrictInt, Field(ge=EPOCH_MS_MIN, le=EPOCH_MS_MAX)]
 MonthParam = Annotated[str, Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")]
@@ -85,7 +96,7 @@ def _now_utc_seconds() -> datetime:
 
 
 def _from_epoch_ms(value: int) -> datetime:
-    # Instants are truncated to whole seconds before they are stored.
+    # Store instants at whole-second precision for consistent comparisons.
     try:
         return datetime.fromtimestamp(value / 1000, tz=UTC).replace(microsecond=0)
     except (OverflowError, OSError, ValueError) as exc:
@@ -248,7 +259,11 @@ def _working_weekday_expr(date_expr):
 
 # ---------------------------------------------------------------------------
 # Request models
+
+
 # ---------------------------------------------------------------------------
+
+
 class EmployeeCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
     emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
@@ -258,7 +273,6 @@ class EmployeeCreate(BaseModel):
     shift_start: ShiftTime = "09:30"
     shift_end: ShiftTime = "18:30"
     joined_on: DateString
-
     @field_validator("joined_on")
     @classmethod
     def validate_joined_on(cls, value: str) -> str:
@@ -267,7 +281,6 @@ class EmployeeCreate(BaseModel):
         except ValueError as exc:
             raise ValueError("joined_on must be a valid calendar date") from exc
         return value
-
     @model_validator(mode="after")
     def validate_shift(self):
         if self.shift_start == self.shift_end:
@@ -280,7 +293,6 @@ class PunchInRequest(BaseModel):
     emp_code: str
     punched_at: Optional[EpochMillis] = None
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
-
     @model_validator(mode="before")
     @classmethod
     def reject_explicit_null_timestamp(cls, values):
@@ -293,7 +305,6 @@ class PunchOutRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     emp_code: str
     punched_at: Optional[EpochMillis] = None
-
     @model_validator(mode="before")
     @classmethod
     def reject_explicit_null_timestamp(cls, values):
@@ -309,7 +320,6 @@ class RegularizeRequest(BaseModel):
     punch_out: Optional[EpochMillis] = None
     reason: str = Field(min_length=5, max_length=200)
     regularized_by: str = Field(min_length=1, max_length=50)
-
     @model_validator(mode="before")
     @classmethod
     def reject_null_patch_fields(cls, values):
@@ -322,17 +332,19 @@ class RegularizeRequest(BaseModel):
 
 # ---------------------------------------------------------------------------
 # Indexes and readiness
+
+
 # ---------------------------------------------------------------------------
-@app.on_event("startup")
+
+
 def ensure_indexes() -> None:
-    """Create indexes idempotently. Keep the app bootable so /health can report 503 if MongoDB is down."""
+    """Create the required indexes; let /health report when MongoDB is unavailable."""
     global _indexes_ready
     try:
         db.employees.create_index([("emp_code", ASCENDING)], unique=True, name="ux_employees_emp_code")
         db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)], name="ix_employees_department_emp")
         db.employees.create_index([("department", ASCENDING), ("joined_on", ASCENDING)], name="ix_employees_department_joined")
         db.employees.create_index([("joined_on", ASCENDING), ("department", ASCENDING)], name="ix_employees_joined_department")
-
         db.attendance_logs.create_index(
             [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True, name="ux_attendance_emp_date"
         )
@@ -351,6 +363,7 @@ def ensure_indexes() -> None:
 
 
 @app.get("/health")
+
 def health():
     try:
         db.command("ping")
@@ -365,8 +378,13 @@ def health():
 
 # ---------------------------------------------------------------------------
 # Employee endpoints
+
+
 # ---------------------------------------------------------------------------
+
+
 @app.post("/employees", status_code=201)
+
 def create_employee(body: EmployeeCreate):
     doc = body.model_dump()
     doc["created_at"] = _now_utc_seconds()
@@ -378,6 +396,7 @@ def create_employee(body: EmployeeCreate):
 
 
 @app.get("/employees")
+
 def list_employees(
     department: Optional[str] = None,
     page: int = Query(1, ge=1),
@@ -391,7 +410,11 @@ def list_employees(
 
 # ---------------------------------------------------------------------------
 # Attendance endpoints
+
+
 # ---------------------------------------------------------------------------
+
+
 def _attendance_query(
     emp_code: Optional[str], date_from: Optional[str], date_to: Optional[str], status: Optional[str]
 ) -> dict:
@@ -421,6 +444,7 @@ def _attendance_sort() -> list[tuple[str, int]]:
 
 
 @app.post("/attendance/punch-in", status_code=201)
+
 def punch_in(body: PunchInRequest):
     employee = db.employees.find_one({"emp_code": body.emp_code})
     if employee is None:
@@ -442,19 +466,19 @@ def punch_in(body: PunchInRequest):
     try:
         db.attendance_logs.insert_one(doc)
     except DuplicateKeyError as exc:
-        # The unique (emp_code, date) index resolves simultaneous check/insert races.
+        # The unique (emp_code, date) index ensures only one concurrent request wins.
         raise HTTPException(409, "already punched in for this date") from exc
     return _attendance_response(doc)
 
 
 @app.post("/attendance/punch-out")
+
 def punch_out(body: PunchOutRequest):
     employee = db.employees.find_one({"emp_code": body.emp_code})
     if employee is None:
         raise HTTPException(404, "employee not found")
     punched_at = _from_epoch_ms(body.punched_at) if body.punched_at is not None else _now_utc_seconds()
-
-    # Most recent record whose punch-in is not later than the requested punch-out.
+    # Find the latest punch-in that occurred at or before this punch-out.
     record = db.attendance_logs.find_one(
         {"emp_code": body.emp_code, "punch_in": {"$ne": None, "$lte": punched_at}},
         sort=[("punch_in", DESCENDING)],
@@ -469,7 +493,6 @@ def punch_out(body: PunchOutRequest):
         raise HTTPException(404, "no punch-in found")
     if record.get("punch_out") is not None:
         raise HTTPException(409, "record is already punched out")
-
     punch_in_at = _as_utc(record["punch_in"])
     assert punch_in_at is not None
     elapsed = punched_at - punch_in_at
@@ -477,7 +500,6 @@ def punch_out(body: PunchOutRequest):
         raise HTTPException(422, "punched_at must be after punch_in")
     if elapsed > timedelta(hours=24):
         raise HTTPException(422, "punch-out cannot be more than 24 hours after punch-in")
-
     derived = _derived_values(record["status"], record["date"], punch_in_at, punched_at, employee)
     updated = db.attendance_logs.find_one_and_update(
         {"_id": record["_id"], "punch_out": None},
@@ -491,6 +513,7 @@ def punch_out(body: PunchOutRequest):
 
 
 @app.get("/attendance")
+
 def list_attendance(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = None,
@@ -506,6 +529,7 @@ def list_attendance(
 
 
 @app.patch("/attendance/{emp_code}/{date}")
+
 def regularize_attendance(
     emp_code: str,
     date: str = Path(pattern=r"^\d{4}-\d{2}-\d{2}$"),
@@ -518,14 +542,12 @@ def regularize_attendance(
     current = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
     if current is None:
         raise HTTPException(404, "attendance record not found")
-
     old_status = current.get("status")
     new_status = body.status if body.status is not None else old_status
     old_in = _as_utc(current.get("punch_in"))
     old_out = _as_utc(current.get("punch_out"))
     new_in = _from_epoch_ms(body.punch_in) if body.punch_in is not None else old_in
     new_out = _from_epoch_ms(body.punch_out) if body.punch_out is not None else old_out
-
     requested_time_supplied = body.punch_in is not None or body.punch_out is not None
     if new_status in ("ABSENT", "LEAVE"):
         if requested_time_supplied:
@@ -543,7 +565,6 @@ def regularize_attendance(
                 raise HTTPException(422, "punch_out must be after punch_in")
             if elapsed_seconds > 24 * 60 * 60:
                 raise HTTPException(422, "punch_out cannot be more than 24 hours after punch_in")
-
     computed = _derived_values(new_status, date, new_in, new_out, employee)
     old_values = {
         "status": old_status,
@@ -569,10 +590,8 @@ def regularize_attendance(
             new_value = _as_utc(new_value) if new_value is not None else None
         if old_value != new_value:
             changes[field_name] = {"from": old_value, "to": new_value}
-
     if not changes:
         raise HTTPException(422, "regularization must change at least one field")
-
     at = _now_utc_seconds()
     history_entry = {
         "at": at,
@@ -603,7 +622,11 @@ def regularize_attendance(
 
 # ---------------------------------------------------------------------------
 # MongoDB aggregation pipelines for analytics
+
+
 # ---------------------------------------------------------------------------
+
+
 def _employee_monthly_pipeline(emp_code: str, start: str, end: str) -> list[dict]:
     working_start_expr = {
         "$dateFromString": {"dateString": {"$cond": [{"$gt": ["$joined_on", start]}, "$joined_on", start]}}
@@ -757,7 +780,7 @@ def _department_trend_pipeline(department: str, from_date: str, to_date: str) ->
         }},
     ]
     return [
-        # One seed employee makes the date series exist even when there are no attendance logs.
+        # Use one employee to seed the date series, even when no attendance logs exist.
         {"$match": {"department": department}},
         {"$limit": 1},
         {"$project": {"_id": 0, "department": 1, "__start": start_date_expr, "__day_count": number_of_days}},
@@ -806,6 +829,7 @@ def _department_trend_pipeline(department: str, from_date: str, to_date: str) ->
 
 
 @app.get("/analytics/employees/{emp_code}/monthly")
+
 def employee_monthly(emp_code: str, month: MonthParam):
     start, end = _month_bounds(month)
     if db.employees.find_one({"emp_code": emp_code}, {"_id": 1}) is None:
@@ -817,6 +841,7 @@ def employee_monthly(emp_code: str, month: MonthParam):
 
 
 @app.get("/analytics/departments/summary")
+
 def department_summary(month: MonthParam, department: Optional[str] = None):
     start, end = _month_bounds(month)
     items = list(db.employees.aggregate(_department_summary_pipeline(start, end, department), allowDiskUse=True))
@@ -824,6 +849,7 @@ def department_summary(month: MonthParam, department: Optional[str] = None):
 
 
 @app.get("/analytics/leaderboard/late")
+
 def late_leaderboard(
     month: MonthParam,
     limit: int = Query(10, ge=1, le=50),
@@ -835,6 +861,7 @@ def late_leaderboard(
 
 
 @app.get("/analytics/departments/{department}/trend")
+
 def department_trend(
     department: str,
     from_date: str = Query(..., alias="from"),
@@ -855,7 +882,11 @@ def department_trend(
 
 # ---------------------------------------------------------------------------
 # Explain endpoint - runs executionStats for the same query/pipeline as the API
+
+
 # ---------------------------------------------------------------------------
+
+
 def _explain_find(collection_name: str, query: dict, sort: list[tuple[str, int]], page: int, page_size: int) -> dict:
     command = {
         "explain": {
@@ -876,6 +907,7 @@ def _explain_aggregate(collection_name: str, pipeline: list[dict]) -> dict:
 
 
 @app.get("/admin/explain/{endpoint}")
+
 def explain_endpoint(
     endpoint: Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"],
     emp_code: Optional[str] = None,
@@ -921,7 +953,6 @@ def explain_endpoint(
             raise HTTPException(422, "department_trend requires a valid range of at most 92 days")
         explain = _explain_aggregate("employees", _department_trend_pipeline(department, from_day.isoformat(), to_day.isoformat()))
         collection_name = "employees"
-
     # Convert BSON-only values into JSON-safe Extended JSON objects while preserving raw explain structure.
     safe_explain = json_util.loads(json_util.dumps(explain))
     return {"endpoint": endpoint, "collection": collection_name, "explain": safe_explain}

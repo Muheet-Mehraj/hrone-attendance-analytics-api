@@ -1,11 +1,11 @@
 # DECISIONS.md
 
-1. **Indexes.** I use a unique `employees.emp_code` index and a unique compound index on `attendance_logs(emp_code, date)` to enforce identity and one attendance row per employee/day. Department and join-date indexes support department headcount and trends. Date/employee, employee/punch-in, and date/status indexes support the list, punch-out, and monthly analytics access patterns. I avoided indexing every derived metric because it would add write cost without helping the main filters.
+1. **Indexes.** Unique `employees.emp_code` and unique `attendance_logs(emp_code, date)` give identity and one record per day. `attendance_logs(date desc, emp_code)` serves the list sort and the leaderboard's month range; `(emp_code, punch_in desc)` finds the record a punch-out closes; `employees(department, joined_on)` serves headcount. I rejected an index on `late_minutes`: the month's date range already narrows the rows, so it would only slow writes.
 
-2. **Punch-in race.** Both requests may initially observe no record, but the database's unique compound index allows only one insert. The winning request gets `201`; the other gets `DuplicateKeyError`, translated to `409`.
+2. **Punch-in race.** Both requests may see no record and insert. The unique `(emp_code, date)` index lets exactly one succeed (201); the other raises `DuplicateKeyError`, which I return as 409.
 
-3. **Ties.** I compute MongoDB competition rank on total late minutes, then sort by minutes and employee code. The cutoff applies to rank, not row count, so all employees tied at a rank within `limit` are returned.
+3. **Ties.** `$setWindowFields` with `$rank` on total late minutes, then `$match rank <= limit`. Limit applies to rank, not row count, so everyone tied at the cutoff is returned (1, 2, 2 with limit 2). Rows sort by minutes, then `emp_code`.
 
-4. **Headcount.** Department summary starts from eligible employees and looks up that employee's logs. Employees with no matching logs still flow to the department grouping and count toward headcount.
+4. **Headcount.** The pipeline starts from `employees` (joined on or before month end) and uses `$lookup` for logs, so someone with zero logs still reaches the department `$group` and is counted.
 
-5. **100x data.** I would measure the real query plans and latency first, then consider pre-aggregated daily summaries and a retention/archive strategy while keeping raw records for audit.
+5. **100x data.** I would store `department` on each attendance log. The trend and leaderboard currently join every log to `employees` just to read the department. Cost: a department change must also update old logs.

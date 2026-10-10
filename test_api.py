@@ -1,4 +1,3 @@
-
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -480,3 +479,65 @@ def test_regularization_recalculates_derived_fields():
     }
     assert changes["late_minutes"] == {"from": 35, "to": 0}
     assert changes["work_hours"] == {"from": 9.08, "to": 9.7}
+
+
+# -------------------------------------------------------------------
+# Extra edge-case tests (expected values worked out by hand from R1-R10)
+# -------------------------------------------------------------------
+
+def test_half_up_rounding_expression():
+    from app.main import _round_expr, db
+
+    coll = db["tmp_round_check"]
+    coll.drop()
+    coll.insert_one({"a": 1.005, "b": 0.285, "c": 9.005})
+    try:
+        out = list(coll.aggregate([{"$project": {
+            "_id": 0,
+            "a": _round_expr("$a", 2),
+            "b": _round_expr("$b", 2),
+            "c": _round_expr("$c", 2),
+        }}]))[0]
+    finally:
+        coll.drop()
+    assert out == {"a": 1.01, "b": 0.29, "c": 9.01}
+
+
+def test_weekend_punch_counts_late_but_not_present_days():
+    emp_code = create_test_employee()
+    # Saturday 2026-10-10, 10:00 IST (04:30 UTC) on a 09:30 shift: 30 minutes late.
+    response = client.post(
+        "/attendance/punch-in",
+        json={"emp_code": emp_code, "punched_at": timestamp_ms(2026, 10, 10, 4, 30)},
+    )
+    assert response.status_code == 201, response.text
+
+    data = client.get(
+        f"/analytics/employees/{emp_code}/monthly", params={"month": "2026-10"}
+    ).json()
+    assert data["present_days"] == 0
+    assert data["late_count"] == 1
+    assert data["total_late_minutes"] == 30
+
+
+def test_monthly_unknown_employee_is_404():
+    response = client.get(
+        f"/analytics/employees/{unique_emp_code()}/monthly", params={"month": "2026-10"}
+    )
+    assert response.status_code == 404, response.text
+
+
+def test_trend_unknown_department_and_bad_range():
+    missing = client.get(
+        "/analytics/departments/NoSuchDept999/trend",
+        params={"from": "2026-10-01", "to": "2026-10-05"},
+    )
+    assert missing.status_code == 404, missing.text
+
+    department = f"RangeTest{uuid4().hex[:8]}"
+    create_employee_for_contract_case(department)
+    reversed_range = client.get(
+        f"/analytics/departments/{department}/trend",
+        params={"from": "2026-10-05", "to": "2026-10-01"},
+    )
+    assert reversed_range.status_code == 422, reversed_range.text

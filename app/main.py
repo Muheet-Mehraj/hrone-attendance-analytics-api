@@ -12,7 +12,7 @@ import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
@@ -247,9 +247,15 @@ def _attendance_response(doc: dict) -> dict:
 
 
 def _round_expr(expr, places: int):
-    """Mongo expression for non-negative ROUND_HALF_UP, avoiding banker's rounding."""
+    """Mongo expression for non-negative ROUND_HALF_UP (R8).
+
+    Doubles cannot represent values like 1.005 exactly, so floor(x*100 + 0.5) can round
+    the wrong way. The arithmetic is done in Decimal128 (which holds 1.005 as 1.005)
+    and only the final result is converted back to a double for the JSON response.
+    """
     scale = 10 ** places
-    return {"$divide": [{"$floor": {"$add": [{"$multiply": [expr, scale]}, 0.5]}}, scale]}
+    shifted = {"$add": [{"$multiply": [{"$toDecimal": expr}, scale]}, {"$toDecimal": "0.5"}]}
+    return {"$toDouble": {"$divide": [{"$trunc": shifted}, scale]}}
 
 
 def _working_weekday_expr(date_expr):
@@ -331,6 +337,123 @@ class RegularizeRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Response models (documentation + output validation; shapes follow openapi.yaml)
+# ---------------------------------------------------------------------------
+
+
+class ErrorBody(BaseModel):
+    detail: str
+
+
+class EmployeeOut(BaseModel):
+    emp_code: str
+    name: str
+    email: str
+    department: str
+    shift_start: str
+    shift_end: str
+    joined_on: str
+    created_at: int
+
+
+class EmployeePage(BaseModel):
+    items: list[EmployeeOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class HistoryEntryOut(BaseModel):
+    at: int
+    by: str
+    reason: str
+    changes: dict[str, dict[str, Any]]
+
+
+class AttendanceOut(BaseModel):
+    emp_code: str
+    date: str
+    status: str
+    punch_in: Optional[int]
+    punch_out: Optional[int]
+    work_hours: Optional[float]
+    late_minutes: int
+    overtime_minutes: int
+    half_day: bool
+    history: list[HistoryEntryOut]
+
+
+class AttendancePage(BaseModel):
+    items: list[AttendanceOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class EmployeeMonthlyOut(BaseModel):
+    emp_code: str
+    month: str
+    working_days: int
+    present_days: float
+    leave_days: int
+    late_count: int
+    total_late_minutes: int
+    total_overtime_minutes: int
+    attendance_pct: Optional[float]
+
+
+class DepartmentSummaryItem(BaseModel):
+    department: str
+    headcount: int
+    present_days: float
+    avg_work_hours: Optional[float]
+    late_count: int
+    total_late_minutes: int
+    leave_count: int
+    on_duty_count: int
+
+
+class DepartmentSummaryOut(BaseModel):
+    month: str
+    items: list[DepartmentSummaryItem]
+
+
+class LeaderboardItem(BaseModel):
+    rank: int
+    emp_code: str
+    name: str
+    department: str
+    total_late_minutes: int
+    late_count: int
+
+
+class LeaderboardOut(BaseModel):
+    month: str
+    items: list[LeaderboardItem]
+
+
+class TrendItem(BaseModel):
+    date: str
+    is_working_day: bool
+    headcount: int
+    present_count: float
+    late_count: int
+    attendance_rate: Optional[float]
+    moving_avg_7d: Optional[float]
+
+
+class TrendOut(BaseModel):
+    department: str
+    items: list[TrendItem]
+
+
+class ExplainOut(BaseModel):
+    endpoint: str
+    collection: str
+    explain: dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
 # Indexes and readiness
 
 
@@ -362,7 +485,10 @@ def ensure_indexes() -> None:
         _indexes_ready = False
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    responses={503: {"model": ErrorBody, "description": "MongoDB is not ready"}},
+)
 
 def health():
     try:
@@ -383,7 +509,12 @@ def health():
 # ---------------------------------------------------------------------------
 
 
-@app.post("/employees", status_code=201)
+@app.post(
+    "/employees",
+    status_code=201,
+    response_model=EmployeeOut,
+    responses={409: {"model": ErrorBody, "description": "Employee code already exists"}},
+)
 
 def create_employee(body: EmployeeCreate):
     doc = body.model_dump()
@@ -395,7 +526,7 @@ def create_employee(body: EmployeeCreate):
     return _employee_response(doc)
 
 
-@app.get("/employees")
+@app.get("/employees", response_model=EmployeePage)
 
 def list_employees(
     department: Optional[str] = None,
@@ -443,7 +574,15 @@ def _attendance_sort() -> list[tuple[str, int]]:
     return [("date", DESCENDING), ("emp_code", ASCENDING)]
 
 
-@app.post("/attendance/punch-in", status_code=201)
+@app.post(
+    "/attendance/punch-in",
+    status_code=201,
+    response_model=AttendanceOut,
+    responses={
+        404: {"model": ErrorBody, "description": "Employee not found"},
+        409: {"model": ErrorBody, "description": "Already punched in for this date"},
+    },
+)
 
 def punch_in(body: PunchInRequest):
     employee = db.employees.find_one({"emp_code": body.emp_code})
@@ -471,7 +610,14 @@ def punch_in(body: PunchInRequest):
     return _attendance_response(doc)
 
 
-@app.post("/attendance/punch-out")
+@app.post(
+    "/attendance/punch-out",
+    response_model=AttendanceOut,
+    responses={
+        404: {"model": ErrorBody, "description": "Employee or punch-in record not found"},
+        409: {"model": ErrorBody, "description": "Attendance record already punched out"},
+    },
+)
 
 def punch_out(body: PunchOutRequest):
     employee = db.employees.find_one({"emp_code": body.emp_code})
@@ -512,7 +658,7 @@ def punch_out(body: PunchOutRequest):
     return _attendance_response(updated)
 
 
-@app.get("/attendance")
+@app.get("/attendance", response_model=AttendancePage)
 
 def list_attendance(
     emp_code: Optional[str] = None,
@@ -528,13 +674,21 @@ def list_attendance(
     return {"items": [_attendance_response(d) for d in docs], "total": total, "page": page, "page_size": page_size}
 
 
-@app.patch("/attendance/{emp_code}/{date}")
+@app.patch(
+    "/attendance/{emp_code}/{date}",
+    response_model=AttendanceOut,
+    responses={
+        404: {"model": ErrorBody, "description": "Employee or attendance record not found"},
+        409: {"model": ErrorBody, "description": "Concurrent regularization conflict"},
+    },
+)
 
 def regularize_attendance(
     emp_code: str,
-    date: str = Path(pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date: str = Path(pattern=r"^\d{4}-\d{2}-\d{2}$"),  # must match {date} in the route
     body: RegularizeRequest = ...,
 ):
+    # NOTE: `date` shadows datetime.date inside this function only; use _parse_date() here.
     _parse_date(date, field_name="date")
     employee = db.employees.find_one({"emp_code": emp_code})
     if employee is None:
@@ -828,7 +982,11 @@ def _department_trend_pipeline(department: str, from_date: str, to_date: str) ->
     ]
 
 
-@app.get("/analytics/employees/{emp_code}/monthly")
+@app.get(
+    "/analytics/employees/{emp_code}/monthly",
+    response_model=EmployeeMonthlyOut,
+    responses={404: {"model": ErrorBody, "description": "Employee not found"}},
+)
 
 def employee_monthly(emp_code: str, month: MonthParam):
     start, end = _month_bounds(month)
@@ -840,7 +998,7 @@ def employee_monthly(emp_code: str, month: MonthParam):
     return {"emp_code": emp_code, "month": month, **result[0]}
 
 
-@app.get("/analytics/departments/summary")
+@app.get("/analytics/departments/summary", response_model=DepartmentSummaryOut)
 
 def department_summary(month: MonthParam, department: Optional[str] = None):
     start, end = _month_bounds(month)
@@ -848,7 +1006,7 @@ def department_summary(month: MonthParam, department: Optional[str] = None):
     return {"month": month, "items": items}
 
 
-@app.get("/analytics/leaderboard/late")
+@app.get("/analytics/leaderboard/late", response_model=LeaderboardOut)
 
 def late_leaderboard(
     month: MonthParam,
@@ -860,7 +1018,11 @@ def late_leaderboard(
     return {"month": month, "items": items}
 
 
-@app.get("/analytics/departments/{department}/trend")
+@app.get(
+    "/analytics/departments/{department}/trend",
+    response_model=TrendOut,
+    responses={404: {"model": ErrorBody, "description": "Department not found"}},
+)
 
 def department_trend(
     department: str,
@@ -906,7 +1068,7 @@ def _explain_aggregate(collection_name: str, pipeline: list[dict]) -> dict:
     return db.command(command)
 
 
-@app.get("/admin/explain/{endpoint}")
+@app.get("/admin/explain/{endpoint}", response_model=ExplainOut)
 
 def explain_endpoint(
     endpoint: Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"],
